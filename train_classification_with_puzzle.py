@@ -43,7 +43,7 @@ parser = argparse.ArgumentParser()
 ###############################################################################
 parser.add_argument('--seed', default=0, type=int)
 parser.add_argument('--num_workers', default=4, type=int)
-parser.add_argument('--data_dir', default='../VOCtrainval_11-May-2012/', type=str)
+parser.add_argument('--data_dir', default='../HDD/dataset/VOC2012/', type=str)
 
 ###############################################################################
 # Network
@@ -54,7 +54,7 @@ parser.add_argument('--mode', default='normal', type=str) # fix
 ###############################################################################
 # Hyperparameter
 ###############################################################################
-parser.add_argument('--batch_size', default=32, type=int)
+parser.add_argument('--batch_size', default=4, type=int)
 parser.add_argument('--max_epoch', default=15, type=int)
 
 parser.add_argument('--lr', default=0.1, type=float)
@@ -67,7 +67,7 @@ parser.add_argument('--max_image_size', default=640, type=int)
 
 parser.add_argument('--print_ratio', default=0.1, type=float)
 
-parser.add_argument('--tag', default='', type=str)
+parser.add_argument('--tag', default='ResNeSt101@Puzzle@optimal', type=str)
 parser.add_argument('--augment', default='', type=str)
 
 # For Puzzle-CAM
@@ -142,7 +142,7 @@ if __name__ == '__main__':
         Transpose_For_Segmentation()
     ])
     
-    meta_dic = read_json('./data/VOC_2012.json')
+    meta_dic = read_json('data/VOC_2012.json')
     class_names = np.asarray(meta_dic['class_names'])
     
     train_dataset = VOC_Dataset_For_Classification(args.data_dir, 'train_aug', train_transform)
@@ -238,22 +238,40 @@ if __name__ == '__main__':
     best_train_mIoU = -1
     thresholds = list(np.arange(0.10, 0.50, 0.05))
 
-    def evaluate(loader):
+    def evaluate(loader, args):
         model.eval()
         eval_timer.tik()
 
-        meter_dic = {th : Calculator_For_mIoU('./data/VOC_2012.json') for th in thresholds}
+        meter_dic = {th : Calculator_For_mIoU('data/VOC_2012.json') for th in thresholds}
+
+        activation = {}
+        def get_activation(name):
+            def hook(model, input, output):
+                activation[name] = output.detach()
+            return hook
+
+        
 
         with torch.no_grad():
             length = len(loader)
             for step, (images, labels, gt_masks) in enumerate(loader):
                 images = images.cuda()
                 labels = labels.cuda()
-
+                ####################################################################
+                model.stage5.register_forward_hook(get_activation('stage5'))
                 _, features = model(images, with_cam=True)
+                interm_feature = activation['stage5']
                 
                 # features = resize_for_tensors(features, images.size()[-2:])
                 # gt_masks = resize_for_tensors(gt_masks, features.size()[-2:], mode='nearest')
+
+                mdc = MultiDilatedConvolution(interm_feature.shape[1], num_classes=20, drates=[1, 3, 6, 9]).cuda()
+                d1, d2, d3, d4 = mdc(interm_feature)
+
+                base_feature = d1
+                dilated_feature = (d2 + d3 + d4) / 3
+                features = base_feature + dilated_feature
+                ####################################################################
 
                 mask = labels.unsqueeze(2).unsqueeze(3)
                 cams = (make_cam(features) * mask)
@@ -262,7 +280,7 @@ if __name__ == '__main__':
                 if step == 0:
                     obj_cams = cams.max(dim=1)[0]
                     
-                    for b in range(8):
+                    for b in range(args.batch_size):
                         image = get_numpy_from_tensor(images[b])
                         cam = get_numpy_from_tensor(obj_cams[b])
 
@@ -276,7 +294,9 @@ if __name__ == '__main__':
                         image = cv2.addWeighted(image, 0.5, cam, 0.5, 0)[..., ::-1]
                         image = image.astype(np.float32) / 255.
 
+                        cv2.imwrite(f'visualization/{b+1}.jpg', image * 255)
                         writer.add_image('CAM/{}'.format(b + 1), image, iteration, dataformats='HWC')
+                        
 
                 for batch_index in range(images.size()[0]):
                     # c, h, w -> h, w, c
@@ -323,62 +343,109 @@ if __name__ == '__main__':
         ###############################################################################
         # Normal
         ###############################################################################
+        
+        ###############################################################################
+        # Dilated Convolution 
+        ###############################################################################
+        activation = {}
+        def get_activation(name):
+            def hook(model, input, output):
+                activation[name] = output.detach()
+            return hook
+
+        model.stage5.register_forward_hook(get_activation('stage5'))
         logits, features = model(images, with_cam=True)
+        interm_feature = activation['stage5']
 
-        ###############################################################################
-        # Puzzle Module
-        ###############################################################################
-        tiled_images = tile_features(images, args.num_pieces)
+        class MultiDilatedConvolution(nn.Module):
+            def __init__(self, in_channels, num_classes=20, drates=[1, 3, 6, 9]):
+                super(MultiDilatedConvolution, self).__init__()
+                self.drates = drates
+                self.in_channels = in_channels
+                self.num_classes = num_classes
 
-        tiled_logits, tiled_features = model(tiled_images, with_cam=True)
+                self.convd1 = nn.Conv2d(self.in_channels, self.num_classes, 
+                                       kernel_size=3, dilation=self.drates[0], padding=self.drates[0])
+                self.convd3 = nn.Conv2d(self.in_channels, self.num_classes, 
+                                       kernel_size=3, dilation=self.drates[1], padding=self.drates[1])      
+                self.convd6 = nn.Conv2d(self.in_channels, self.num_classes, 
+                                       kernel_size=3, dilation=self.drates[2], padding=self.drates[2])
+                self.convd9 = nn.Conv2d(self.in_channels, self.num_classes, 
+                                       kernel_size=3, dilation=self.drates[3], padding=self.drates[3])  
+
+            def forward(self, x):
+
+                d1 = self.convd1(x)
+                d2 = self.convd3(x)
+                d3 = self.convd6(x)
+                d4 = self.convd9(x)
+
+                output = [d1, d2, d3, d4]
+
+                return output
         
-        re_features = merge_features(tiled_features, args.num_pieces, args.batch_size)
+        mdc = MultiDilatedConvolution(interm_feature.shape[1], num_classes=20, drates=[1, 3, 6, 9]).cuda()
+        dilated_output = mdc(interm_feature)
 
-        ###############################################################################
-        # Losses
-        ###############################################################################
-        if args.level == 'cam':
-            features = make_cam(features)
-            re_features = make_cam(re_features)
-        
-        class_loss = class_loss_fn(logits, labels).mean()
+        loss = 0
 
-        if 'pcl' in loss_option:
-            p_class_loss = class_loss_fn(gap_fn(re_features), labels).mean()
-        else:
-            p_class_loss = torch.zeros(1).cuda()
+        for dilated_feature in dilated_output:
+            loss += class_loss_fn(gap_fn(dilated_feature), labels).mean()
+
+        # ###############################################################################
+        # # Puzzle Module
+        # ###############################################################################
+        # tiled_images = tile_features(images, args.num_pieces)
+
+        # tiled_logits, tiled_features = model(tiled_images, with_cam=True)
         
-        if 're' in loss_option:
-            if args.re_loss_option == 'masking':
-                class_mask = labels.unsqueeze(2).unsqueeze(3)
-                re_loss = re_loss_fn(features, re_features) * class_mask
-                re_loss = re_loss.mean()
-            elif args.re_loss_option == 'selection':
-                re_loss = 0.
-                for b_index in range(labels.size()[0]):
-                    class_indices = labels[b_index].nonzero(as_tuple=True)
-                    selected_features = features[b_index][class_indices]
-                    selected_re_features = re_features[b_index][class_indices]
+        # re_features = merge_features(tiled_features, args.num_pieces, args.batch_size)
+
+        # ###############################################################################
+        # # Losses
+        # ###############################################################################
+        # if args.level == 'cam':
+        #     features = make_cam(features)
+        #     re_features = make_cam(re_features)
+        
+        # class_loss = class_loss_fn(logits, labels).mean()
+
+        # if 'pcl' in loss_option:
+        #     p_class_loss = class_loss_fn(gap_fn(re_features), labels).mean()
+        # else:
+        #     p_class_loss = torch.zeros(1).cuda()
+        
+        # if 're' in loss_option:
+        #     if args.re_loss_option == 'masking':
+        #         class_mask = labels.unsqueeze(2).unsqueeze(3)
+        #         re_loss = re_loss_fn(features, re_features) * class_mask
+        #         re_loss = re_loss.mean()
+        #     elif args.re_loss_option == 'selection':
+        #         re_loss = 0.
+        #         for b_index in range(labels.size()[0]):
+        #             class_indices = labels[b_index].nonzero(as_tuple=True)
+        #             selected_features = features[b_index][class_indices]
+        #             selected_re_features = re_features[b_index][class_indices]
                     
-                    re_loss_per_feature = re_loss_fn(selected_features, selected_re_features).mean()
-                    re_loss += re_loss_per_feature
-                re_loss /= labels.size()[0]
-            else:
-                re_loss = re_loss_fn(features, re_features).mean()
-        else:
-            re_loss = torch.zeros(1).cuda()
+        #             re_loss_per_feature = re_loss_fn(selected_features, selected_re_features).mean()
+        #             re_loss += re_loss_per_feature
+        #         re_loss /= labels.size()[0]
+        #     else:
+        #         re_loss = re_loss_fn(features, re_features).mean()
+        # else:
+        #     re_loss = torch.zeros(1).cuda()
 
-        if 'conf' in loss_option:
-            conf_loss = shannon_entropy_loss(tiled_logits)
-        else:
-            conf_loss = torch.zeros(1).cuda()
+        # if 'conf' in loss_option:
+        #     conf_loss = shannon_entropy_loss(tiled_logits)
+        # else:
+        #     conf_loss = torch.zeros(1).cuda()
         
-        if args.alpha_schedule == 0.0:
-            alpha = args.alpha
-        else:
-            alpha = min(args.alpha * iteration / (max_iteration * args.alpha_schedule), args.alpha)
+        # if args.alpha_schedule == 0.0:
+        #     alpha = args.alpha
+        # else:
+        #     alpha = min(args.alpha * iteration / (max_iteration * args.alpha_schedule), args.alpha)
         
-        loss = class_loss + p_class_loss + alpha * re_loss + conf_loss
+        # loss = class_loss + p_class_loss + alpha * re_loss + conf_loss
         #################################################################################################
         
         optimizer.zero_grad()
@@ -387,59 +454,61 @@ if __name__ == '__main__':
 
         train_meter.add({
             'loss' : loss.item(), 
-            'class_loss' : class_loss.item(),
-            'p_class_loss' : p_class_loss.item(),
-            're_loss' : re_loss.item(),
-            'conf_loss' : conf_loss.item(),
-            'alpha' : alpha,
+            # 'class_loss' : class_loss.item(),
+            # 'p_class_loss' : p_class_loss.item(),
+            # 're_loss' : re_loss.item(),
+            # 'conf_loss' : conf_loss.item(),
+            # 'alpha' : alpha,
         })
         
         #################################################################################################
         # For Log
         #################################################################################################
         if (iteration + 1) % log_iteration == 0:
-            loss, class_loss, p_class_loss, re_loss, conf_loss, alpha = train_meter.get(clear=True)
+            # loss, class_loss, p_class_loss, re_loss, conf_loss, alpha = train_meter.get(clear=True)
+            loss = train_meter.get(clear=True)
             learning_rate = float(get_learning_rate_from_optimizer(optimizer))
             
             data = {
                 'iteration' : iteration + 1,
                 'learning_rate' : learning_rate,
-                'alpha' : alpha,
+                # 'alpha' : alpha,
                 'loss' : loss,
-                'class_loss' : class_loss,
-                'p_class_loss' : p_class_loss,
-                're_loss' : re_loss,
-                'conf_loss' : conf_loss,
+                # 'class_loss' : class_loss,
+                # 'p_class_loss' : p_class_loss,
+                # 're_loss' : re_loss,
+                # 'conf_loss' : conf_loss,
                 'time' : train_timer.tok(clear=True),
             }
             data_dic['train'].append(data)
             write_json(data_path, data_dic)
 
             log_func('[i] \
-                iteration={iteration:,}, \
-                learning_rate={learning_rate:.4f}, \
-                alpha={alpha:.2f}, \
+                # iteration={iteration:,}, \
+                # learning_rate={learning_rate:.4f}, \
+                # alpha={alpha:.2f}, \
                 loss={loss:.4f}, \
-                class_loss={class_loss:.4f}, \
-                p_class_loss={p_class_loss:.4f}, \
-                re_loss={re_loss:.4f}, \
-                conf_loss={conf_loss:.4f}, \
+                # class_loss={class_loss:.4f}, \
+                # p_class_loss={p_class_loss:.4f}, \
+                # re_loss={re_loss:.4f}, \
+                # conf_loss={conf_loss:.4f}, \
                 time={time:.0f}sec'.format(**data)
             )
 
             writer.add_scalar('Train/loss', loss, iteration)
-            writer.add_scalar('Train/class_loss', class_loss, iteration)
-            writer.add_scalar('Train/p_class_loss', p_class_loss, iteration)
-            writer.add_scalar('Train/re_loss', re_loss, iteration)
-            writer.add_scalar('Train/conf_loss', conf_loss, iteration)
+            # writer.add_scalar('Train/class_loss', class_loss, iteration)
+            # writer.add_scalar('Train/p_class_loss', p_class_loss, iteration)
+            # writer.add_scalar('Train/re_loss', re_loss, iteration)
+            # writer.add_scalar('Train/conf_loss', conf_loss, iteration)
             writer.add_scalar('Train/learning_rate', learning_rate, iteration)
-            writer.add_scalar('Train/alpha', alpha, iteration)
+            # writer.add_scalar('Train/alpha', alpha, iteration)
         
         #################################################################################################
         # Evaluation
         #################################################################################################
-        if (iteration + 1) % val_iteration == 0:
-            threshold, mIoU = evaluate(train_loader_for_seg)
+        # if (iteration + 1) % val_iteration == 0:
+        if (iteration + 1) >= 0:
+            threshold, mIoU = evaluate(train_loader_for_seg, args)
             
             if best_train_mIoU == -1 or best_train_mIoU < mIoU:
                 best_train_mIoU = mIoU
